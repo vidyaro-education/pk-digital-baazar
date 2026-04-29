@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  pk-bazar-bot:
+    build: .
+    container_name: pk_bazar_bot
+    restart: unless-stopped
+
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - DATABASE_PATH=/data/shop.db
+      # Add any other env vars here
+
+    volumes:
+      # Persist the SQLite database across restarts/redeploys
+      - bot_data:/data
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bot_data:

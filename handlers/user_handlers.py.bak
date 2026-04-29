@@ -1,0 +1,324 @@
+# handlers/user_handlers.py
+import logging
+from io import BytesIO
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InputFile,
+)
+from telegram.ext import ContextTypes
+
+from handlers.common import register_user, rate_limit, paginate, STATUS_EMOJI
+from services.product_service import get_active_products, get_product_by_id
+from services.order_service import (
+    create_order,
+    get_user_orders,
+    get_latest_pending_order,
+    attach_screenshot,
+    get_order_by_id,
+)
+from services.user_service import get_user_by_telegram_id, get_all_admins  # moved to top
+from services.qr_service import generate_payment_qr
+
+logger = logging.getLogger(__name__)
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("🛍️ Product List"), KeyboardButton("📦 My Orders")],
+        [KeyboardButton("💬 Support")],
+    ],
+    resize_keyboard=True,
+)
+
+
+# ── /start ────────────────────────────────────────────────────────────────────
+
+@register_user
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.effective_user.first_name or "there"
+    await update.message.reply_text(
+        f"👋 Welcome to *PK Bazar*, {name}!\n\n"
+        "Use the menu below to browse products, check orders, or get support.",
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+# ── Product List ──────────────────────────────────────────────────────────────
+
+@register_user
+@rate_limit
+async def list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    products = await get_active_products()
+    if not products:
+        # Works for both Message and CallbackQuery contexts
+        await _reply(update, "😔 No products available right now.")
+        return
+
+    page = context.user_data.get("product_page", 0)
+    items, total = paginate(products, page)
+
+    for p in items:
+        text = (
+            f"🛍️ *{p['name']}*\n"
+            f"📝 {p['description'] or 'No description'}\n"
+            f"💰 ₹{p['price']:.2f}\n"
+        )
+        if p.get("validity_months"):
+            text += f"⏳ Valid for: {p['validity_months']} months\n"
+
+        kb = [[InlineKeyboardButton("🛒 Buy Now", callback_data=f"buy_{p['id']}")]]
+        markup = InlineKeyboardMarkup(kb)
+
+        # Resolve the correct chat to send to (message vs callback query)
+        chat_id = update.effective_chat.id
+
+        try:
+            if p.get("image_file_id"):
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=p["image_file_id"],
+                    caption=text,
+                    parse_mode="Markdown",
+                    reply_markup=markup,
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="Markdown",
+                    reply_markup=markup,
+                )
+        except Exception as e:
+            logger.error("Failed to send product %s: %s", p["id"], e)
+
+    # Pagination buttons
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"prod_page_{page - 1}"))
+    if page < total - 1:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"prod_page_{page + 1}"))
+    if nav:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Page {page + 1}/{total}",
+            reply_markup=InlineKeyboardMarkup([nav]),
+        )
+
+
+async def product_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        page = int(query.data.split("_")[-1])
+    except (ValueError, IndexError):
+        logger.warning("Invalid product page callback data: %s", query.data)
+        return
+
+    context.user_data["product_page"] = page
+
+    # Delete the old pagination message, then re-render the product list
+    try:
+        await query.message.delete()
+    except Exception as e:
+        logger.warning("Could not delete pagination message: %s", e)
+
+    await list_products(update, context)
+
+
+# ── Buy flow ──────────────────────────────────────────────────────────────────
+
+@register_user
+async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        product_id = int(query.data.split("_")[1])
+    except (ValueError, IndexError):
+        await query.message.reply_text("❌ Invalid product selection.")
+        return
+
+    product = await get_product_by_id(product_id)
+    if not product or not product.get("is_active"):
+        await query.message.reply_text("❌ This product is no longer available.")
+        return
+
+    user = await get_user_by_telegram_id(update.effective_user.id)
+    if not user:
+        await query.message.reply_text("❌ Could not find your account. Please /start again.")
+        return
+
+    order_id = await create_order(user["id"], product_id, product["price"])
+
+    if order_id is None:
+        await query.message.reply_text(
+            "⚠️ You already have a pending order for this product.\n"
+            "Please complete or wait for it to be processed."
+        )
+        return
+
+    # Generate & send QR
+    try:
+        qr_bytes = generate_payment_qr(product["price"], order_id)
+    except Exception as e:
+        logger.error("QR generation failed for order %s: %s", order_id, e)
+        await query.message.reply_text("❌ Failed to generate payment QR. Please try again.")
+        return
+
+    caption = (
+        f"🧾 *Order #{order_id} Created!*\n\n"
+        f"Product : {product['name']}\n"
+        f"Amount  : ₹{product['price']:.2f}\n\n"
+        "📲 Scan the QR code to pay via UPI.\n"
+        "📸 After payment, send your *payment screenshot* here."
+    )
+    await query.message.reply_photo(
+        photo=InputFile(BytesIO(qr_bytes), filename="payment_qr.png"),
+        caption=caption,
+        parse_mode="Markdown",
+    )
+    context.user_data["awaiting_screenshot_order"] = order_id
+
+
+# ── Screenshot handler ────────────────────────────────────────────────────────
+
+@register_user
+async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text(
+            "❌ Please send a valid payment *screenshot* (photo).",
+            parse_mode="Markdown",
+        )
+        return
+
+    user = await get_user_by_telegram_id(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("❌ Could not find your account. Please /start again.")
+        return
+
+    order_id = context.user_data.get("awaiting_screenshot_order")
+
+    # Validate the context-stored order is still pending
+    if order_id:
+        order = await get_order_by_id(order_id)
+        if not order or order.get("status") != "PENDING":
+            order_id = None
+            context.user_data.pop("awaiting_screenshot_order", None)
+
+    # Fall back to latest pending order
+    if not order_id:
+        order = await get_latest_pending_order(user["id"])
+        if not order:
+            await update.message.reply_text(
+                "⚠️ No pending order found. Please buy a product first."
+            )
+            return
+        order_id = order["id"]
+
+    file_id = update.message.photo[-1].file_id
+
+    try:
+        await attach_screenshot(order_id, file_id)
+    except Exception as e:
+        logger.error("Failed to attach screenshot for order %s: %s", order_id, e)
+        await update.message.reply_text("❌ Failed to save screenshot. Please try again.")
+        return
+
+    context.user_data.pop("awaiting_screenshot_order", None)
+
+    await update.message.reply_text(
+        f"✅ Screenshot received for *Order #{order_id}*!\n"
+        "Our admin will verify and approve shortly. 🕐",
+        parse_mode="Markdown",
+    )
+
+    # Notify all admins
+    order_detail = await get_order_by_id(order_id)
+    if not order_detail:
+        logger.warning("Could not fetch order detail for admin notification, order %s", order_id)
+        return
+
+    notif = (
+        f"📸 *New Payment Screenshot*\n\n"
+        f"Order  : #{order_id}\n"
+        f"User   : {order_detail['user_name']} (ID: {order_detail['telegram_id']})\n"
+        f"Product: {order_detail['product_name']}\n"
+        f"Amount : ₹{order_detail['price']:.2f}"
+    )
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{order_id}"),
+            InlineKeyboardButton("❌ Reject",  callback_data=f"reject_{order_id}"),
+        ]
+    ])
+
+    admins = await get_all_admins()
+    for admin in admins:
+        try:
+            await context.bot.send_photo(
+                chat_id=admin["telegram_id"],
+                photo=file_id,
+                caption=notif,
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+        except Exception as e:
+            logger.warning("Could not notify admin %s: %s", admin["telegram_id"], e)
+
+
+# ── My Orders ─────────────────────────────────────────────────────────────────
+
+@register_user
+async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = await get_user_by_telegram_id(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("❌ Could not find your account. Please /start again.")
+        return
+
+    orders = await get_user_orders(user["id"])
+
+    if not orders:
+        await update.message.reply_text("📦 You have no orders yet.")
+        return
+
+    text = "📦 *Your Orders:*\n\n"
+    for o in orders[:10]:
+        emoji = STATUS_EMOJI.get(o["status"], "❓")
+        text += (
+            f"{emoji} *Order #{o['id']}*\n"
+            f"   Product : {o['product_name']}\n"
+            f"   Amount  : ₹{o['price']:.2f}\n"
+            f"   Status  : {o['status']}\n"
+            f"   Date    : {o['created_at'][:10]}\n\n"
+        )
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ── Support ───────────────────────────────────────────────────────────────────
+
+@register_user
+async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "💬 *Support*\n\n"
+        "For any help, contact our admin @Padhai\\_karo\\_bot.",
+        parse_mode="Markdown",
+    )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _reply(update: Update, text: str, **kwargs):
+    """Send a text reply regardless of whether the update is a Message or CallbackQuery."""
+    if update.message:
+        await update.message.reply_text(text, **kwargs)
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(text, **kwargs)
+    else:
+        logger.warning("_reply: no message or callback_query on update %s", update.update_id)

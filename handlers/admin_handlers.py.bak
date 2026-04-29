@@ -1,0 +1,687 @@
+# handlers/admin_handlers.py
+import logging
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
+from telegram.ext import ContextTypes, ConversationHandler
+
+from handlers.common import admin_only, paginate, STATUS_EMOJI
+from services.product_service import (
+    get_all_products,
+    add_product,
+    update_product,
+    delete_product,
+    toggle_product,
+    get_product_by_id,
+)
+from services.order_service import (
+    get_all_orders,
+    get_orders_by_status,
+    update_order_status,
+    get_order_by_id,
+    STATUS_APPROVED,
+    STATUS_REJECTED,
+)
+from services.user_service import (
+    get_all_users,
+    add_admin,
+    remove_admin,
+    get_all_admins,
+    ban_user,
+    unban_user,
+)
+
+logger = logging.getLogger(__name__)
+
+# ── Conversation states ───────────────────────────────────────────────────────
+(
+    AP_NAME, AP_DESC, AP_PRICE, AP_IMAGE, AP_VALIDITY,   # Add product
+    EP_FIELD, EP_VALUE,                                   # Edit product
+    BROADCAST_MSG,                                        # Broadcast
+    MSG_USER_ID, MSG_USER_TEXT,                           # Message user
+    ADD_ADMIN_ID,                                         # Add admin
+    REMOVE_ADMIN_ID,                                      # Remove admin
+) = range(12)
+
+ADMIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📦 Products"),  KeyboardButton("🧾 Orders")],
+        [KeyboardButton("👥 Users"),     KeyboardButton("📢 Broadcast")],
+        [KeyboardButton("🔐 Admins"),    KeyboardButton("🏠 Home")],
+    ],
+    resize_keyboard=True,
+)
+
+
+# ── Admin panel entry ─────────────────────────────────────────────────────────
+
+@admin_only
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔐 *Admin Panel*\n\nChoose a section from the menu below:",
+        parse_mode="Markdown",
+        reply_markup=ADMIN_KEYBOARD,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRODUCT MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@admin_only
+async def admin_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    products = await get_all_products()
+
+    if not products:
+        await update.message.reply_text("📦 No products yet.")
+    else:
+        for p in products:
+            status = "✅ Active" if p["is_active"] else "❌ Inactive"
+            validity = f"{p['validity_months']}h" if p.get("validity_months") else "No expiry"
+            text = (
+                f"*#{p['id']} — {p['name']}*\n"
+                f"📝 {p.get('description') or 'No description'}\n"
+                f"💰 Price   : ₹{p['price']:.2f}\n"
+                f"⏳ Validity: {validity}\n"
+                f"📊 Status  : {status}"
+            )
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✏️ Edit",   callback_data=f"edit_prod_{p['id']}"),
+                InlineKeyboardButton("🗑️ Delete", callback_data=f"del_prod_{p['id']}"),
+                InlineKeyboardButton("🔄 Toggle", callback_data=f"tog_prod_{p['id']}"),
+            ]])
+            if p.get("image_file_id"):
+                await update.message.reply_photo(
+                    photo=p["image_file_id"],
+                    caption=text,
+                    parse_mode="Markdown",
+                    reply_markup=kb,
+                )
+            else:
+                await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+    await update.message.reply_text(
+        "➕ Add a new product?",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("➕ Add Product", callback_data="add_product")]]
+        ),
+    )
+
+
+# ── Add product conversation ──────────────────────────────────────────────────
+
+@admin_only
+async def add_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    context.user_data["new_product"] = {}
+    if q:
+        await q.answer()
+        await q.message.reply_text("📝 Enter product *name*:", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("📝 Enter product *name*:", parse_mode="Markdown")
+    return AP_NAME
+
+
+async def ap_get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_product"]["name"] = update.message.text.strip()
+    await update.message.reply_text(
+        "📝 Enter *description* (or /skip):", parse_mode="Markdown"
+    )
+    return AP_DESC
+
+
+async def ap_get_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    context.user_data["new_product"]["description"] = "" if text == "/skip" else text
+    await update.message.reply_text("💰 Enter *price* (₹):", parse_mode="Markdown")
+    return AP_PRICE
+
+
+async def ap_get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        price = float(update.message.text.strip())
+        if price <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Invalid price. Enter a positive number:")
+        return AP_PRICE
+    context.user_data["new_product"]["price"] = price
+    await update.message.reply_text(
+        "🖼️ Send product *image* (or /skip):", parse_mode="Markdown"
+    )
+    return AP_IMAGE
+
+
+async def ap_get_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_product"]["image_file_id"] = (
+        update.message.photo[-1].file_id if update.message.photo else None
+    )
+    await update.message.reply_text(
+        "⏳ Enter *validity in months* (0 = no expiry):", parse_mode="Markdown"
+    )
+    return AP_VALIDITY
+
+
+async def ap_skip_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_product"]["image_file_id"] = None
+    await update.message.reply_text(
+        "⏳ Enter *validity in months* (0 = no expiry):", parse_mode="Markdown"
+    )
+    return AP_VALIDITY
+
+
+async def ap_get_validity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        hours = int(update.message.text.strip())
+        if hours < 0:
+            raise ValueError
+    except ValueError:
+        months = 0
+
+    p = context.user_data.pop("new_product", {})
+    try:
+        product_id = await add_product(
+            name=p["name"],
+            description=p.get("description", ""),
+            price=p["price"],
+            image_file_id=p.get("image_file_id"),
+            validity_months=months,
+        )
+        await update.message.reply_text(
+            f"✅ Product *{p['name']}* added! (ID: `{product_id}`)",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error("Failed to add product: %s", e)
+        await update.message.reply_text("❌ Failed to add product. Please try again.")
+
+    return ConversationHandler.END
+
+
+async def ap_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("new_product", None)
+    await update.message.reply_text("❌ Cancelled.")
+    return ConversationHandler.END
+
+
+# ── Edit product conversation ─────────────────────────────────────────────────
+
+@admin_only
+async def edit_product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    product_id = int(query.data.split("_")[-1])
+    product = await get_product_by_id(product_id)
+    if not product:
+        await query.message.reply_text("❌ Product not found.")
+        return ConversationHandler.END
+
+    context.user_data["edit_product_id"] = product_id
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📛 Name",        callback_data="ep_name")],
+        [InlineKeyboardButton("📝 Description", callback_data="ep_desc")],
+        [InlineKeyboardButton("💰 Price",       callback_data="ep_price")],
+        [InlineKeyboardButton("🖼️ Image",       callback_data="ep_image")],
+        [InlineKeyboardButton("⏳ Validity",    callback_data="ep_validity")],
+        [InlineKeyboardButton("❌ Cancel",      callback_data="ep_cancel")],
+    ])
+    await query.message.reply_text(
+        f"✏️ Editing *{product['name']}* (ID `{product_id}`)\n\nWhat do you want to change?",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return EP_FIELD
+
+
+async def ep_choose_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    field = query.data  # ep_name / ep_desc / ep_price / ep_image / ep_validity / ep_cancel
+
+    if field == "ep_cancel":
+        context.user_data.pop("edit_product_id", None)
+        await query.message.reply_text("❌ Edit cancelled.")
+        return ConversationHandler.END
+
+    prompts = {
+        "ep_name":     "📛 Enter new *name*:",
+        "ep_desc":     "📝 Enter new *description* (or /skip to clear):",
+        "ep_price":    "💰 Enter new *price* (₹):",
+        "ep_image":    "🖼️ Send new *image* (or /skip to remove):",
+        "ep_validity": "⏳ Enter new *validity in months* (0 = no expiry):",
+    }
+    context.user_data["edit_field"] = field
+    await query.message.reply_text(prompts[field], parse_mode="Markdown")
+    return EP_VALUE
+
+
+async def ep_get_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    field = context.user_data.pop("edit_field", None)
+    product_id = context.user_data.pop("edit_product_id", None)
+
+    if not field or not product_id:
+        await update.message.reply_text("❌ Something went wrong. Please start over.")
+        return ConversationHandler.END
+
+    text = update.message.text.strip() if update.message.text else None
+    kwargs = {}
+
+    try:
+        if field == "ep_name":
+            if not text:
+                await update.message.reply_text("❌ Name cannot be empty.")
+                return EP_VALUE
+            kwargs["name"] = text
+
+        elif field == "ep_desc":
+            kwargs["description"] = "" if text == "/skip" else (text or "")
+
+        elif field == "ep_price":
+            price = float(text)
+            if price <= 0:
+                raise ValueError
+            kwargs["price"] = price
+
+        elif field == "ep_image":
+            if update.message.photo:
+                kwargs["image_file_id"] = update.message.photo[-1].file_id
+            elif text == "/skip":
+                kwargs["image_file_id"] = None
+            else:
+                await update.message.reply_text("❌ Please send a photo or /skip.")
+                context.user_data["edit_field"] = field
+                context.user_data["edit_product_id"] = product_id
+                return EP_VALUE
+
+        elif field == "ep_validity":
+            months = int(text)
+            if months < 0:
+                raise ValueError
+            kwargs["validity_months"] = months
+
+    except (ValueError, TypeError):
+        await update.message.reply_text("❌ Invalid value. Please try again.")
+        context.user_data["edit_field"] = field
+        context.user_data["edit_product_id"] = product_id
+        return EP_VALUE
+
+    await update_product(product_id, **kwargs)
+    await update.message.reply_text(
+        f"✅ Product `#{product_id}` updated successfully!", parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+
+# ── Delete / Toggle callbacks ─────────────────────────────────────────────────
+
+@admin_only
+async def delete_product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    product_id = int(query.data.split("_")[-1])
+
+    # Confirm before deleting
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, delete", callback_data=f"confirm_del_{product_id}"),
+        InlineKeyboardButton("❌ Cancel",      callback_data="cancel_del"),
+    ]])
+    await query.message.reply_text(
+        f"⚠️ Are you sure you want to delete product `#{product_id}`?",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+
+@admin_only
+async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel_del":
+        await query.message.reply_text("❌ Deletion cancelled.")
+        return
+
+    product_id = int(query.data.split("_")[-1])
+    await delete_product(product_id)
+    await query.message.reply_text(f"🗑️ Product `#{product_id}` deleted.", parse_mode="Markdown")
+
+
+@admin_only
+async def toggle_product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    product_id = int(query.data.split("_")[-1])
+    await toggle_product(product_id)
+    product = await get_product_by_id(product_id)
+    state = "Active ✅" if product["is_active"] else "Inactive ❌"
+    await query.message.reply_text(
+        f"Product `#{product_id}` is now *{state}*.", parse_mode="Markdown"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ORDER MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@admin_only
+async def admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 All",      callback_data="orders_all"),
+            InlineKeyboardButton("⏳ Pending",  callback_data="orders_PENDING"),
+        ],
+        [
+            InlineKeyboardButton("📸 Waiting Confirmation", callback_data="orders_WAITING_PAYMENT_CONFIRMATION"),
+        ],
+        [
+            InlineKeyboardButton("✅ Approved", callback_data="orders_APPROVED"),
+            InlineKeyboardButton("❌ Rejected", callback_data="orders_REJECTED"),
+        ],
+    ])
+    await update.message.reply_text("🧾 *Orders — choose a filter:*", parse_mode="Markdown", reply_markup=kb)
+
+
+@admin_only
+async def orders_filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    filter_key = query.data.split("_", 1)[1]
+
+    orders = await get_all_orders() if filter_key == "all" else await get_orders_by_status(filter_key)
+
+    if not orders:
+        await query.message.reply_text("No orders found.")
+        return
+
+    items, total = paginate(orders, 0, per_page=5)
+
+    for o in items:
+        emoji = STATUS_EMOJI.get(o["status"], "❓")
+        text = (
+            f"{emoji} *Order #{o['id']}*\n"
+            f"👤 User    : {o['user_name']} (`{o['telegram_id']}`)\n"
+            f"🛍️ Product : {o['product_name']}\n"
+            f"💰 Amount  : ₹{o['price']:.2f}\n"
+            f"📊 Status  : {o['status']}\n"
+            f"📅 Date    : {o['created_at'][:16]}"
+        )
+        buttons = []
+        if o["status"] == "WAITING_PAYMENT_CONFIRMATION":
+            buttons = [
+                InlineKeyboardButton("✅ Approve", callback_data=f"approve_{o['id']}"),
+                InlineKeyboardButton("❌ Reject",  callback_data=f"reject_{o['id']}"),
+            ]
+        kb = InlineKeyboardMarkup([buttons]) if buttons else None
+
+        if o.get("screenshot_file_id"):
+            await query.message.reply_photo(
+                photo=o["screenshot_file_id"],
+                caption=text,
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+        else:
+            await query.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+    if total > 1:
+        await query.message.reply_text(f"_Showing page 1/{total}. More orders exist._", parse_mode="Markdown")
+
+
+@admin_only
+async def approve_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    order_id = int(query.data.split("_")[1])
+    await update_order_status(order_id, STATUS_APPROVED)
+
+    order = await get_order_by_id(order_id)
+    await query.message.reply_text(
+        f"✅ Order `#{order_id}` *approved*.", parse_mode="Markdown"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=order["telegram_id"],
+            text=(
+                f"🎉 *Your order has been approved!*\n\n"
+                f"Order   : #{order_id}\n"
+                f"Product : {order['product_name']}\n\n"
+                "Thank you for shopping at PK Bazar! 🛒"
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning("Could not notify user for order %s: %s", order_id, e)
+
+
+@admin_only
+async def reject_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    order_id = int(query.data.split("_")[1])
+    await update_order_status(order_id, STATUS_REJECTED, note="Rejected by admin")
+
+    order = await get_order_by_id(order_id)
+    await query.message.reply_text(
+        f"❌ Order `#{order_id}` *rejected*.", parse_mode="Markdown"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=order["telegram_id"],
+            text=(
+                f"😔 *Your order has been rejected.*\n\n"
+                f"Order   : #{order_id}\n"
+                f"Product : {order['product_name']}\n\n"
+                "If you believe this is an error, please contact support."
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning("Could not notify user for order %s: %s", order_id, e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# USER MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@admin_only
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = await get_all_users()
+    if not users:
+        await update.message.reply_text("👥 No users yet.")
+        return
+
+    text = f"👥 *Total users: {len(users)}*\n\n"
+    for u in users[:20]:
+        banned = " 🚫" if u.get("is_banned") else ""
+        admin_tag = " 🔐" if u.get("is_admin") else ""
+        text += f"• {u.get('name') or 'Unknown'} (`{u['telegram_id']}`){admin_tag}{banned}\n"
+
+    if len(users) > 20:
+        text += f"\n_...and {len(users) - 20} more._"
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🚫 Ban User",   callback_data="prompt_ban"),
+            InlineKeyboardButton("✅ Unban User", callback_data="prompt_unban"),
+        ],
+        [InlineKeyboardButton("✉️ Message User", callback_data="prompt_msg_user")],
+    ])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+@admin_only
+async def ban_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /ban <telegram_id>")
+        return
+    await ban_user(int(context.args[0]))
+    await update.message.reply_text(
+        f"🚫 User `{context.args[0]}` banned.", parse_mode="Markdown"
+    )
+
+
+@admin_only
+async def unban_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /unban <telegram_id>")
+        return
+    await unban_user(int(context.args[0]))
+    await update.message.reply_text(
+        f"✅ User `{context.args[0]}` unbanned.", parse_mode="Markdown"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MESSAGING
+# ══════════════════════════════════════════════════════════════════════════════
+
+@admin_only
+async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📢 Enter the *broadcast message* to send to all users\n(or /cancel to abort):",
+        parse_mode="Markdown",
+    )
+    return BROADCAST_MSG
+
+
+async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    users = await get_all_users()
+    success = 0
+    for u in users:
+        try:
+            await context.bot.send_message(
+                chat_id=u["telegram_id"],
+                text=f"📢 *Announcement*\n\n{text}",
+                parse_mode="Markdown",
+            )
+            success += 1
+        except Exception:
+            pass
+    await update.message.reply_text(
+        f"✅ Broadcast sent to *{success}/{len(users)}* users.", parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+
+@admin_only
+async def msg_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry via keyboard button or callback."""
+    q = update.callback_query
+    if q:
+        await q.answer()
+        await q.message.reply_text(
+            "👤 Enter the *Telegram ID* of the user to message:", parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "👤 Enter the *Telegram ID* of the user to message:", parse_mode="Markdown"
+        )
+    return MSG_USER_ID
+
+
+async def msg_user_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        context.user_data["msg_target"] = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Invalid ID. Enter a numeric Telegram ID:")
+        return MSG_USER_ID
+    await update.message.reply_text("✍️ Enter your message:")
+    return MSG_USER_TEXT
+
+
+async def msg_user_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = context.user_data.pop("msg_target", None)
+    if not target:
+        return ConversationHandler.END
+    try:
+        await context.bot.send_message(
+            chat_id=target,
+            text=f"💬 *Message from Admin:*\n\n{update.message.text}",
+            parse_mode="Markdown",
+        )
+        await update.message.reply_text("✅ Message sent successfully.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to send message: {e}")
+    return ConversationHandler.END
+
+
+async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("new_product", None)
+    context.user_data.pop("edit_product_id", None)
+    context.user_data.pop("edit_field", None)
+    context.user_data.pop("msg_target", None)
+    await update.message.reply_text("❌ Cancelled.")
+    return ConversationHandler.END
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@admin_only
+async def manage_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admins = await get_all_admins()
+    text = "🔐 *Current Admins:*\n\n"
+    for a in admins:
+        text += f"• `{a['telegram_id']}` (added {a['created_at'][:10]})\n"
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Add Admin",    callback_data="prompt_add_admin"),
+            InlineKeyboardButton("➖ Remove Admin", callback_data="prompt_remove_admin"),
+        ]
+    ])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+@admin_only
+async def add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text(
+        "➕ Enter the *Telegram ID* to add as admin:", parse_mode="Markdown"
+    )
+    return ADD_ADMIN_ID
+
+
+async def add_admin_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        new_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Invalid ID. Enter a numeric Telegram ID:")
+        return ADD_ADMIN_ID
+    ok = await add_admin(new_id, update.effective_user.id)
+    await update.message.reply_text(
+        f"✅ `{new_id}` added as admin." if ok else "❌ Failed (already admin or error).",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+@admin_only
+async def remove_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text(
+        "➖ Enter the *Telegram ID* to remove from admins:", parse_mode="Markdown"
+    )
+    return REMOVE_ADMIN_ID
+
+
+async def remove_admin_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        rem_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ Invalid ID.")
+        return REMOVE_ADMIN_ID
+    ok = await remove_admin(rem_id)
+    await update.message.reply_text(
+        f"✅ `{rem_id}` removed from admins." if ok else "❌ Failed (not found or error).",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END

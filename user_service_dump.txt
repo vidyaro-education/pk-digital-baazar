@@ -1,0 +1,209 @@
+﻿from database.db import get_connection
+
+
+# ðŸ”¹ Check admin
+async def is_admin(telegram_id: int) -> bool:
+    conn = await get_connection()
+
+    cursor = await conn.execute(
+        "SELECT * FROM admins WHERE telegram_id = ?",
+        (telegram_id,)
+    )
+    admin = await cursor.fetchone()
+
+    await conn.close()
+    return admin is not None
+
+
+# ðŸ”¹ Add admin
+async def add_admin(telegram_id: int):
+    conn = await get_connection()
+
+    await conn.execute(
+        "INSERT OR IGNORE INTO admins (telegram_id) VALUES (?)",
+        (telegram_id,)
+    )
+    await conn.commit()
+    await conn.close()
+
+    return True
+
+
+# ðŸ”¹ Remove admin
+async def remove_admin(telegram_id: int):
+    conn = await get_connection()
+
+    await conn.execute(
+        "DELETE FROM admins WHERE telegram_id = ?",
+        (telegram_id,)
+    )
+    await conn.commit()
+    await conn.close()
+
+    return True
+
+
+# ðŸ”¹ Get all admins
+async def get_all_admins():
+    conn = await get_connection()
+
+    cursor = await conn.execute("SELECT * FROM admins")
+    admins = await cursor.fetchall()
+
+    await conn.close()
+    return [dict(admin) for admin in admins]
+
+
+# ðŸ”¹ Ban user âœ… (FIX)
+async def ban_user(telegram_id: int):
+    conn = await get_connection()
+
+    await conn.execute(
+        "UPDATE users SET banned = 1 WHERE telegram_id = ?",
+        (telegram_id,)
+    )
+    await conn.commit()
+    await conn.close()
+
+    return True
+
+
+# ðŸ”¹ Unban user (optional à¦•à¦¿à¦¨à§à¦¤à§ à¦¦à¦°à¦•à¦¾à¦° à¦¹à¦¤à§‡ à¦ªà¦¾à¦°à§‡)
+async def unban_user(telegram_id: int):
+    conn = await get_connection()
+
+    await conn.execute(
+        "UPDATE users SET banned = 0 WHERE telegram_id = ?",
+        (telegram_id,)
+    )
+    await conn.commit()
+    await conn.close()
+
+    return True
+
+
+# ðŸ”¹ Get all users
+async def get_all_users():
+    conn = await get_connection()
+
+    cursor = await conn.execute("SELECT * FROM users")
+    users = await cursor.fetchall()
+
+    await conn.close()
+    return [dict(user) for user in users]
+
+
+# ðŸ”¹ Get user
+async def get_user_by_telegram_id(telegram_id: int):
+    conn = await get_connection()
+
+    cursor = await conn.execute(
+        "SELECT * FROM users WHERE telegram_id = ?",
+        (telegram_id,)
+    )
+    user = await cursor.fetchone()
+
+    await conn.close()
+    return dict(user) if user else None
+async def get_or_create_user(telegram_id: int, name: str, username: str):
+    conn = await get_connection()
+
+    cursor = await conn.execute(
+        "SELECT * FROM users WHERE telegram_id = ?",
+        (telegram_id,)
+    )
+    user = await cursor.fetchone()
+
+    if user:
+        await conn.close()
+        return dict(user)
+
+    await conn.execute(
+        "INSERT INTO users (telegram_id, name, username) VALUES (?, ?, ?)",
+        (telegram_id, name, username)
+    )
+    await conn.commit()
+
+    cursor = await conn.execute(
+        "SELECT * FROM users WHERE telegram_id = ?",
+        (telegram_id,)
+    )
+    new_user = await cursor.fetchone()
+
+    await conn.close()
+    return dict(new_user)
+# handlers/common.py
+import functools
+import logging
+from telegram import Update
+from telegram.ext import ContextTypes
+from services.user_service import is_admin, get_or_create_user
+
+logger = logging.getLogger(__name__)
+
+RATE_LIMIT_SECONDS = 2
+_last_action: dict[int, float] = {}
+
+
+def admin_only(func):
+    """Decorator â€“ only lets admins through."""
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        uid = update.effective_user.id
+        if not await is_admin(uid):
+            await update.effective_message.reply_text("â›” Admin access required.")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+
+def register_user(func):
+    """Decorator â€“ upserts user and blocks banned accounts."""
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        if user:
+            record = await get_or_create_user(
+                user.id, user.full_name, user.username
+            )
+            if record.get("is_banned"):
+                await update.effective_message.reply_text(
+                    "ðŸš« You have been banned from this bot."
+                )
+                return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+
+def rate_limit(func):
+    """Decorator â€“ simple per-user rate limiter."""
+    import time
+
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        uid = update.effective_user.id
+        now = time.monotonic()
+        if now - _last_action.get(uid, 0) < RATE_LIMIT_SECONDS:
+            await update.effective_message.reply_text(
+                "â³ Please slow down a bit!"
+            )
+            return
+        _last_action[uid] = now
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+
+def paginate(items: list, page: int, per_page: int = 5):
+    """Return (page_items, total_pages)."""
+    total = max(1, (len(items) + per_page - 1) // per_page)
+    page  = max(0, min(page, total - 1))
+    start = page * per_page
+    return items[start : start + per_page], total
+
+
+STATUS_EMOJI = {
+    "PENDING":                       "ðŸ•",
+    "WAITING_PAYMENT_CONFIRMATION":  "ðŸ’³",
+    "APPROVED":                      "âœ…",
+    "REJECTED":                      "âŒ",
+}
