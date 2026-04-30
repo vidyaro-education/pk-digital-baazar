@@ -897,7 +897,9 @@ async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"• {u['name'] or 'Unknown'} (`{u['telegram_id']}`){banned}\n"
     if len(users) > 20:
         text += f"\n_...and {len(users) - 20} more._"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Message User", callback_data="prompt_msg_user")]])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
 
 @admin_only
@@ -946,7 +948,12 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def msg_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👤 Enter the user's Telegram ID:")
+    if update.callback_query:
+        await update.callback_query.answer()
+        msg = update.callback_query.message
+    else:
+        msg = update.message
+    await msg.reply_text("👤 Enter the user's Telegram ID:")
     return MSG_USER_ID
 
 
@@ -956,14 +963,20 @@ async def msg_user_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Invalid ID.")
         return MSG_USER_ID
-    await update.message.reply_text("✍️ Enter your message:")
+    await update.message.reply_text("✍️ You are now chatting with this user. Type your messages below.\nType /stopchat to end.")
     return MSG_USER_TEXT
 
 
 async def msg_user_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target = context.user_data.pop("msg_target", None)
+    target = context.user_data.get("msg_target")
     if not target:
         return ConversationHandler.END
+        
+    if update.message.text == "/stopchat":
+        context.user_data.pop("msg_target", None)
+        await update.message.reply_text("🛑 Chat session ended.")
+        return ConversationHandler.END
+        
     try:
         await context.bot.send_message(
             chat_id=target,
@@ -973,7 +986,7 @@ async def msg_user_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Message sent.")
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {e}")
-    return ConversationHandler.END
+    return MSG_USER_TEXT
 
 
 async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):

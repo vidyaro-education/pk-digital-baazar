@@ -30,6 +30,7 @@ from handlers.user_handlers import (
     back_to_list_callback,
     help_btn_callback,
     resell_btn_callback,
+    forward_to_admins,
 )
 from handlers.admin_handlers import (
     admin_panel,
@@ -232,6 +233,9 @@ def main():
 
     # ── Channel membership check ───────────────────────────────────────────────
     app.add_handler(CallbackQueryHandler(check_membership_callback, pattern="^check_membership$"))
+
+    # ── Catch-all for user messages (Forwards replies to admins) ───────────────
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forward_to_admins))
 
     # ── Photo handler (must be last) ───────────────────────────────────────────
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_screenshot))

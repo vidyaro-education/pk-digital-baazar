@@ -452,3 +452,26 @@ async def _reply(update: Update, text: str, **kwargs):
         await update.callback_query.message.reply_text(text, **kwargs)
     else:
         logger.warning("_reply: no message or callback_query on update %s", update.update_id)
+
+
+# ── Forward User Replies ───────────────────────────────────────────────────────
+
+@register_user
+async def forward_to_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text
+    if not text:
+        return
+        
+    admins = await get_all_admins()
+    msg = f"📩 *Message from* {user.first_name} (`{user.id}`):\n\n{text}"
+    
+    for admin in admins:
+        try:
+            await context.bot.send_message(
+                chat_id=admin["telegram_id"],
+                text=msg,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
