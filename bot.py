@@ -56,7 +56,7 @@ from handlers.admin_handlers import (
     admin_users,
     ban_user_cmd, unban_user_cmd,
     broadcast_start, broadcast_send,
-    msg_user_start, msg_user_get_id, msg_user_send,
+    msg_user_start, msg_user_get_id, msg_user_send, stop_msg_user,
     conv_cancel,
     manage_admins,
     add_admin_start, add_admin_do,
@@ -168,7 +168,7 @@ def main():
             MSG_USER_ID:   [MessageHandler(filters.TEXT & ~filters.COMMAND, msg_user_get_id)],
             MSG_USER_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, msg_user_send)],
         },
-        fallbacks=[CommandHandler("cancel", conv_cancel)],
+        fallbacks=[CommandHandler("cancel", conv_cancel), CommandHandler("stopchat", stop_msg_user)],
     ))
 
     # ── Add admin conversation ─────────────────────────────────────────────────

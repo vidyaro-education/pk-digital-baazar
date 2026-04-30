@@ -971,12 +971,7 @@ async def msg_user_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = context.user_data.get("msg_target")
     if not target:
         return ConversationHandler.END
-        
-    if update.message.text == "/stopchat":
-        context.user_data.pop("msg_target", None)
-        await update.message.reply_text("🛑 Chat session ended.")
-        return ConversationHandler.END
-        
+
     try:
         await context.bot.send_message(
             chat_id=target,
@@ -987,6 +982,12 @@ async def msg_user_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Failed: {e}")
     return MSG_USER_TEXT
+
+
+async def stop_msg_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("msg_target", None)
+    await update.message.reply_text("🛑 Chat session ended.")
+    return ConversationHandler.END
 
 
 async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
