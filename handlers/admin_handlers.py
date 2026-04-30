@@ -183,7 +183,8 @@ async def ap_get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         price = float(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("❌ Invalid price. Enter a number:")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
+        await update.message.reply_text("❌ Invalid price. Enter a number:", reply_markup=kb)
         return AP_PRICE
     context.user_data["new_product"]["price"] = price
     await update.message.reply_text("🖼️ Send product *image* (or /skip):", parse_mode="Markdown")
@@ -237,7 +238,11 @@ async def ap_get_validity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ap_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("new_product", None)
-    await update.message.reply_text("❌ Cancelled.")
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text("❌ Cancelled.")
+    else:
+        await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
 
 
@@ -516,7 +521,8 @@ async def pl_get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         price = float(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("❌ Invalid price. Enter a number:")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
+        await update.message.reply_text("❌ Invalid price. Enter a number:", reply_markup=kb)
         return PL_PRICE
     context.user_data["new_plan"]["price"] = price
     await update.message.reply_text(
@@ -557,7 +563,11 @@ async def pl_get_validity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pl_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("new_plan", None)
-    await update.message.reply_text("❌ Cancelled.")
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text("❌ Cancelled.")
+    else:
+        await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
 
 
