@@ -19,6 +19,9 @@ FROM python:3.11-slim
 # Non-root user for security
 RUN useradd -m -u 1000 botuser
 
+# Create data directory for SQLite to be writable by botuser
+RUN mkdir -p /data && chown -R botuser:botuser /data
+
 WORKDIR /app
 
 # Copy installed packages from builder
@@ -31,6 +34,7 @@ USER botuser
 
 # Unbuffered output so logs appear immediately in Coolify
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    DATABASE_PATH=/data/shop.db
 
 CMD ["python", "bot.py"]

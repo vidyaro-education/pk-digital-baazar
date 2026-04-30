@@ -25,6 +25,7 @@ async def get_connection():
 async def init_db():
     async with aiosqlite.connect(DATABASE_PATH) as conn:
         conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode=WAL;")
 
         await conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
